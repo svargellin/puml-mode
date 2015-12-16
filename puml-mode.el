@@ -1,12 +1,12 @@
-;;; puml-mode.el --- Major mode for PlantUML
+;;; puml-mode.el --- Major mode for PlantUML    -*- lexical-binding: t; -*-
 
 ;; Filename: puml-mode.el
 ;; Description: Major mode for PlantUML diagrams sources
-;; Compatibility: Tested with Emacs 24.3 and 24.4 on OS X 10.10
+;; Compatibility: Tested with Emacs 24.3 through 24.5 on OS X 10.10
 ;; Author: Zhang Weize (zwz)
 ;; Maintainer: Carlo Sciolla (skuro)
-;; Keywords: uml ascii
-;; Version: 0.4
+;; Keywords: uml plantuml ascii
+;; Version: 0.6.2
 
 ;; You can redistribute this program and/or modify it under the terms
 ;; of the GNU General Public License as published by the Free Software
@@ -27,6 +27,12 @@
 
 ;;; Change log:
 ;;
+;; version 0.6.4, 2015-12-12 Added support for comments (single and multiline) -- thanks to https://github.com/nivekuil
+;; version 0.6.3, 2015-11-07 Added per-buffer configurability of output type (thanks to https://github.com/davazp)
+;; version 0.6.2, 2015-11-07 Added debugging capabilities to improve issue analysis
+;; version 0.6.1, 2015-09-26 Bugfix: use eq to compare symbols instead of cl-equalp
+;; version 0.6, 2015-09-26 Fixed PNG preview
+;; version 0.5, 2015-09-21 Added preview capabilities
 ;; version 0.4, 2015-06-14 Use a puml- prefix to distinguish from the other plantuml-mode
 ;; version 0.3, 2015-06-13 Compatibility with Emacs 24.x
 ;; version 0.2, 2010-09-20 Initialize the keywords from the -language output of plantuml.jar instead of the hard-coded way.
@@ -45,18 +51,28 @@
 
 (defvar puml-mode-hook nil "Standard hook for puml-mode.")
 
-(defvar puml-mode-version "0.4" "The puml-mode version string.")
+(defvar puml-mode-version "0.6.1" "The puml-mode version string.")
 
-(defvar puml-mode-map nil "Keymap for puml-mode.")
+(defvar puml-mode-debug-enabled nil)
+
+(defvar puml-font-lock-keywords nil)
+
+(defvar puml-mode-map
+  (let ((keymap (make-keymap)))
+    (define-key keymap (kbd "C-c C-c") 'puml-preview)
+    keymap)
+  "Keymap for puml-mode.")
 
 ;;; syntax table
 (defvar puml-mode-syntax-table
   (let ((synTable (make-syntax-table)))
-    (modify-syntax-entry ?' "< b" synTable)
-    (modify-syntax-entry ?\n "> b" synTable)
-    (modify-syntax-entry ?! "w" synTable)
-    (modify-syntax-entry ?@ "w" synTable)
-    (modify-syntax-entry ?# "'" synTable)
+    (modify-syntax-entry ?\/  ". 41"    synTable)
+    (modify-syntax-entry ?'   "! 23b"    synTable)
+    (modify-syntax-entry ?\n  ">"       synTable)
+    (modify-syntax-entry ?\r  ">"       synTable)
+    (modify-syntax-entry ?!   "w"       synTable)
+    (modify-syntax-entry ?@   "w"       synTable)
+    (modify-syntax-entry ?#   "'"       synTable)
     synTable)
   "Syntax table for `puml-mode'.")
 
@@ -68,7 +84,26 @@
 ;; keyword completion
 (defvar puml-plantuml-kwdList nil "The plantuml keywords.")
 
-;;; font-lock
+(defun puml-enable-debug ()
+  "Enables debug messages into the *PUML Messages* buffer."
+  (interactive)
+  (setq puml-mode-debug-enabled t))
+
+(defun puml-disable-debug ()
+  "Stops any debug messages to be added into the *PUML Messages* buffer."
+  (interactive)
+  (setq puml-mode-debug-enabled nil))
+
+(defun puml-debug (msg)
+  "Writes msg (as MSG) into the *PUML Messages* buffer without annoying the user."
+  (if puml-mode-debug-enabled
+      (let* ((log-buffer-name "*PUML Messages*")
+             (log-buffer (get-buffer-create log-buffer-name)))
+        (save-excursion
+          (with-current-buffer log-buffer
+            (goto-char (point-max))
+            (insert msg)
+            (insert "\n"))))))
 
 (defun puml-init ()
   "Initialize the keywords or builtins from the cmdline language output."
@@ -110,9 +145,77 @@
                             puml-plantuml-builtins
                             (split-string
                              (buffer-substring-no-properties pos (point)))))))
-;;                  ((string= word "skinparameter")
-;;                  ((string= word "color")))
             (setq found (search-forward ";" nil nil)))))))
+
+(defconst puml-preview-buffer "*PUML Preview*")
+
+(defvar puml-output-type
+  (if (not (display-images-p))
+      "utxt"
+    (cond ((image-type-available-p 'svg) "svg")
+	  ((image-type-available-p 'png) "png")
+	  (t "utxt")))
+  "Specify the desired output type to use for generated diagrams.")
+
+(defun puml-read-output-type ()
+  "Read from the minibuffer a output type."
+  (let* ((completion-ignore-case t)
+         (available-types
+          (append
+           (and (image-type-available-p 'svg) '("svg"))
+           (and (image-type-available-p 'png) '("png"))
+           '("utxt"))))
+    (completing-read (format "Output type [%s]: " puml-output-type)
+                     available-types
+                     nil
+                     t
+                     nil
+                     nil
+                     puml-output-type)))
+
+(defun puml-set-output-type (type)
+  "Set the desired output type (as TYPE) for the current buffer.
+If the
+major mode of the current buffer mode is not puml-mode, set the
+default output type for new buffers."
+  (interactive (list (puml-read-output-type)))
+  (setq puml-output-type type))
+
+(defun puml-is-image-output-p ()
+  "Return true if the diagram output format is an image, false if it's text based."
+  (not (equal "utxt" puml-output-type)))
+
+(defun puml-output-type-opt ()
+  "Create the flag to pass to PlantUML to produce the selected output format."
+  (concat "-t" puml-output-type))
+
+(defun puml-preview ()
+  "Preview diagram."
+  (interactive)
+  (let ((b (get-buffer puml-preview-buffer)))
+    (when b
+      (kill-buffer b)))
+
+  (let* ((imagep (and (display-images-p)
+                      (puml-is-image-output-p)))
+         (process-connection-type nil)
+         (buf (get-buffer-create puml-preview-buffer))
+         (coding-system-for-read (and imagep 'binary))
+         (coding-system-for-write (and imagep 'binary)))
+
+    (let ((ps (start-process "PUML" buf
+                             "java" "-jar" (shell-quote-argument puml-plantuml-jar-path)
+                             (puml-output-type-opt) "-p")))
+      (process-send-region ps (point-min) (point-max))
+      (process-send-eof ps)
+      (set-process-sentinel ps
+                            (lambda (ps event)
+                              (unless (equal event "finished\n")
+                                (error "PUML Preview failed: %s" event))
+                              (switch-to-buffer puml-preview-buffer)
+                              (when imagep
+                                (image-mode)
+                                (set-buffer-multibyte t)))))))
 
 (unless puml-plantuml-kwdList
   (puml-init)
@@ -169,32 +272,24 @@
           (t (message "Making completion list...")
              (with-output-to-temp-buffer "*Completions*"
                (display-completion-list
-                (all-completions meat puml-plantuml-kwdList)
-                meat))
+                (all-completions meat puml-plantuml-kwdList)))
              (message "Making completion list...%s" "done")))))
 
 (add-to-list 'auto-mode-alist '("\\.pum$" . puml-mode))
 
 ;;;###autoload
-(defun puml-mode ()
+(define-derived-mode puml-mode prog-mode "puml"
   "Major mode for plantuml.
 
 Shortcuts             Command Name
 \\[puml-complete-symbol]      `puml-complete-symbol'"
-
-  (interactive)
-  (kill-all-local-variables)
-
-;;  (python-mode) ; for indentation
-  (setq major-mode 'puml-mode
-        mode-name "puml")
-  (set-syntax-table puml-mode-syntax-table)
-  (use-local-map puml-mode-map)
-
-  (make-local-variable 'font-lock-defaults)
-  (setq font-lock-defaults '((puml-font-lock-keywords) nil t))
-
-  (run-mode-hooks 'puml-mode-hook))
+  (make-local-variable 'puml-output-type)
+  (set (make-local-variable 'comment-start-skip) "\\('+\\|/'+\\)\\s *")
+  (set (make-local-variable 'comment-start) "/'")
+  (set (make-local-variable 'comment-end) "'/")
+  (set (make-local-variable 'comment-multi-line) t)
+  (set (make-local-variable 'comment-style) 'extra-line)
+  (setq font-lock-defaults '((puml-font-lock-keywords) nil t)))
 
 (provide 'puml-mode)
 ;;; puml-mode.el ends here
